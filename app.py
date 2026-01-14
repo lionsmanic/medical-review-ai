@@ -7,31 +7,39 @@ from PIL import Image
 import io
 import time
 
-# --- 頁面設定 ---
-st.set_page_config(page_title="AI 醫學期刊審稿助手 (Gemini版)", layout="wide")
+# --- 1. 頁面設定 ---
+st.set_page_config(page_title="AI 醫學期刊審稿助手 (Gemini Flash版)", layout="wide")
 
+# --- 2. 側邊欄設定 ---
 with st.sidebar:
-    st.header("設定")
+    st.header("⚙️ 設定面板")
     gemini_api_key = st.text_input("輸入 Google Gemini API Key", type="password")
+    
     email_address = st.text_input(
-        "輸入 Email (NCBI 要求)", 
+        "輸入 Email (PubMed 規定)", 
         value="doctor@example.com",
-        help="PubMed 搜尋功能需要 Email 作為識別。"
+        help="NCBI 要求使用 PubMed API 時需附上聯絡 Email，以防濫用。"
     )
+    
     st.markdown("---")
-    st.success("✅ 目前使用模型：Gemini 1.5 Pro (擅長長文本與圖表分析)")
+    st.info("✅ 目前使用模型：Gemini 1.5 Flash (速度快、支援長文本)")
+    st.markdown("---")
+    st.markdown("**支援功能：**\n- 自動摘要\n- PubMed 最新文獻比對\n- 審稿問題生成\n- **最終判決建議 (Accept/Revision/Reject)**")
 
+# 設定 Entrez email
 Entrez.email = email_address
 
-# --- 初始化 Gemini ---
+# --- 3. 初始化 Gemini 模型 ---
 def get_gemini_model(api_key):
     genai.configure(api_key=api_key)
-    # 使用 gemini-1.5-pro，因為它的邏輯推理和醫學理解能力最強
-    return genai.GenerativeModel('gemini-1.5-pro')
+    # 使用 gemini-1.5-flash，它是目前最穩定且免費額度較寬鬆的模型
+    # 適合處理長篇論文與大量圖片
+    return genai.GenerativeModel('gemini-1.5-flash')
 
-# --- 工具函式 ---
+# --- 4. 檔案讀取工具函式 ---
 
 def get_text_from_pdf(file_obj):
+    """讀取 PDF 文字"""
     try:
         reader = PdfReader(file_obj)
         text = ""
@@ -43,6 +51,7 @@ def get_text_from_pdf(file_obj):
         return f"[PDF讀取錯誤: {e}]"
 
 def get_text_from_docx(file_obj):
+    """讀取 Word 文字"""
     try:
         doc = Document(file_obj)
         text = "\n".join([para.text for para in doc.paragraphs])
@@ -54,97 +63,120 @@ def analyze_image_content(image_file, model):
     """直接將圖片物件傳給 Gemini 進行分析"""
     try:
         image = Image.open(image_file)
-        prompt = "這是醫學論文的附圖。請詳細描述這張圖片中的數據、趨勢、圖例與關鍵資訊，忽略無關的頁碼。"
+        prompt = "這是醫學論文的附圖。請詳細描述這張圖片中的數據、趨勢、圖例與關鍵資訊，忽略無關的頁碼或浮水印。"
+        # Gemini 支援直接輸入圖片物件
         response = model.generate_content([prompt, image])
         return response.text
     except Exception as e:
         return f"[圖片分析錯誤: {e}]"
 
-# --- PubMed 搜尋 (維持不變) ---
+# --- 5. PubMed 搜尋功能 ---
 def search_pubmed(keywords, max_results=5):
+    """根據關鍵字搜尋 2024 年至今的文獻"""
     try:
-        # 搜尋 2024 年以後的文章
+        # 設定搜尋範圍：2024/01/01 到現在
         search_term = f"{keywords} AND (2024/01/01[Date - Publication] : 3000[Date - Publication])"
+        
+        # 1. 搜尋 ID
         handle = Entrez.esearch(db="pubmed", term=search_term, retmax=max_results, sort="date")
         record = Entrez.read(handle)
         handle.close()
         
         id_list = record["IdList"]
         if not id_list:
-            return "未找到相關最新文獻 (2024-Now)。"
+            return "未找到 2024 年後的最新相關文獻。"
 
+        # 2. 抓取摘要
         handle = Entrez.efetch(db="pubmed", id=id_list, rettype="abstract", retmode="text")
         abstracts = handle.read()
         handle.close()
         return abstracts
     except Exception as e:
-        return f"PubMed API 錯誤: {e}"
+        return f"PubMed API 連線錯誤: {e}"
 
-# --- 核心流程 ---
+# --- 6. 核心 AI 分析流程 ---
 def run_full_analysis(combined_text, api_key):
     model = get_gemini_model(api_key)
     
-    # 1. 提取關鍵字
-    st.status("步驟 1/3: Gemini 正在閱讀並提取關鍵字...", expanded=True)
+    # --- 階段 A: 提取關鍵字 ---
+    st.status("步驟 1/3: AI 正在閱讀全文並提取關鍵字...", expanded=True)
     
     keyword_prompt = f"""
     任務：你是一位專業的醫學審稿人。請閱讀以下論文內容，提取 3-5 個核心醫學關鍵字 (MeSH terms)，用於在 PubMed 檢索最新文獻。
-    輸出要求：只要關鍵字，用英文，以空格分隔。
+    輸出要求：只要關鍵字，用英文，以空格分隔，不要有其他廢話。
     
     論文內容片段：
     {combined_text[:5000]}
     """
     
-    # 呼叫 Gemini
     try:
         kw_response = model.generate_content(keyword_prompt)
         keywords = kw_response.text.strip()
         st.success(f"搜尋關鍵字: {keywords}")
     except Exception as e:
-        st.error(f"Gemini 連線錯誤: {e}")
-        return "Error"
+        st.error(f"Gemini 連線錯誤 (階段A): {e}")
+        return None
 
-    # 2. 搜尋 PubMed
+    # --- 階段 B: 搜尋 PubMed ---
     st.status(f"步驟 2/3: 正在搜尋 PubMed 最新文獻...", expanded=True)
     pubmed_data = search_pubmed(keywords)
     
-    # 3. 綜合審稿
-    st.status("步驟 3/3: Gemini 正在撰寫口語化審閱報告...", expanded=True)
+    # --- 階段 C: 綜合審稿與判決 ---
+    st.status("步驟 3/3: Gemini 正在撰寫口語化審閱報告與最終建議...", expanded=True)
     
     review_prompt = f"""
     角色設定：
     你是一位資深、臨床經驗豐富的醫師前輩。這是一份來自你同事的論文投稿。
     
-    語氣要求 (非常重要)：
-    1. **口語化、像真人**：就像在醫院休息室喝咖啡時的對話。
+    語氣要求：
+    1. **口語化**：像是在醫生休息室喝咖啡時的對話，輕鬆但專業。
     2. **禁止 AI 腔**：不要用「首先、其次、綜上所述」這種八股文。
-    3. **專業但直接**：直接講這篇有沒有臨床價值，數據可不可信。
+    3. **直球對決**：有問題直接點出來，好的地方也不要吝嗇稱讚。
 
-    任務：
-    1. **整體評價**：這篇論文想解決什麼問題？設計有沒有亮點？
+    任務內容：
+    
+    1. **整體評價 (General Comments)**：
+       簡單講一下這篇在做什麼，臨床意義大不大。
+       
     2. **文獻對照 (Reality Check)**：
-       參考下方我提供的【PubMed 最新文獻】，這篇論文的發現是符合最新趨勢，還是已經過時？或是與最新數據矛盾？
-    3. **待釐清問題 (Queries)**：
-       列出 3-5 個具體且尖銳的問題，要求作者解釋（例如：樣本數太少、排除標準不清楚、統計方法有誤等）。
+       參考下方我提供的【PubMed 最新文獻】，這篇論文的發現是符合最新趨勢 (e.g. 2024-2025年的研究)，還是已經過時？或是與最新數據矛盾？
+       
+    3. **待釐清問題 (Queries for Authors)**：
+       列出 3-5 個具體且尖銳的問題，要求作者解釋（例如：樣本數太少、排除標準不清楚、統計方法有誤、圖表數據不一致等）。
+       
+    4. **最終判決建議 (Recommendation)**：
+       請根據學術慣例，從以下四個選項中選一個，並用粗體標示，且說明理由：
+       - **Accept** (直接接受)
+       - **Minor Revision** (小修)
+       - **Major Revision** (大修)
+       - **Reject** (拒絕)
 
     ---
-    【投稿論文內容】
-    {combined_text[:15000]} 
-    (Gemini 支援長文本，若更長可自行調整)
+    【投稿論文內容 (包含圖表描述)】
+    {combined_text[:20000]} 
 
     【PubMed 最新文獻摘要 (2024-Now)】
     {pubmed_data}
     ---
     
-    請用繁體中文輸出結果。
+    請用**繁體中文**輸出結果。
     """
     
-    final_response = model.generate_content(review_prompt)
-    return final_response.text
+    try:
+        final_response = model.generate_content(review_prompt)
+        return final_response.text
+    except Exception as e:
+        st.error(f"Gemini 連線錯誤 (階段C): {e}")
+        return None
 
-# --- 主程式 ---
-st.title("🩺 AI 醫學期刊審稿助手 (Gemini Pro 版)")
-st.markdown("使用 **Google Gemini 1.5 Pro** 模型。支援 PDF, Word, 多種圖檔整合分析。")
+# --- 7. 主介面邏輯 ---
+st.title("🩺 AI 醫學期刊審稿助手")
+st.markdown("""
+此工具協助醫師快速分析投稿論文。
+1. 上傳 PDF/Word/圖檔 (支援多檔一次上傳)
+2. 自動抓取 PubMed 最新文獻比對
+3. 生成口語化評論與 **Accept/Reject 建議**
+""")
 
 uploaded_files = st.file_uploader(
     "請選擇所有相關檔案 (Main text, Cover letter, Figures...)", 
@@ -153,17 +185,21 @@ uploaded_files = st.file_uploader(
 )
 
 if uploaded_files and gemini_api_key:
-    if st.button("開始整合分析"):
+    if st.button("開始整合分析", type="primary"):
         model = get_gemini_model(gemini_api_key)
         combined_text = ""
         
+        # 進度條
         progress_bar = st.progress(0)
+        status_text = st.empty()
         total_files = len(uploaded_files)
         
+        # --- 迴圈處理所有檔案 ---
         for idx, file in enumerate(uploaded_files):
             file_name = file.name
             file_type = file_name.split('.')[-1].lower()
             
+            status_text.text(f"正在讀取檔案：{file_name} ...")
             combined_text += f"\n\n--- 檔案來源：{file_name} ---\n"
             
             try:
@@ -172,25 +208,33 @@ if uploaded_files and gemini_api_key:
                 elif file_type in ['docx', 'doc']:
                     combined_text += get_text_from_docx(file)
                 elif file_type in ['jpg', 'jpeg', 'png', 'tiff', 'tif']:
-                    # 針對圖片，我們直接呼叫 Gemini 看圖並轉成文字描述
-                    # 這樣可以讓最後的總結 Prompt 知道圖片裡有什麼
+                    # 圖片處理
                     img_desc = analyze_image_content(file, model)
                     combined_text += f"\n[圖片描述]: {img_desc}\n"
-                    # 稍微暫停一下避免觸發 API 頻率限制 (雖然 Gemini 限制很寬)
-                    time.sleep(1)
+                    time.sleep(1) # 避免太快
                 
             except Exception as e:
                 st.error(f"處理檔案 {file_name} 時發生錯誤: {e}")
             
             progress_bar.progress((idx + 1) / total_files)
 
-        st.success(f"檔案讀取完畢，Gemini 開始分析...")
+        status_text.text("檔案讀取完畢，開始 AI 分析...")
         
+        # --- 執行分析 ---
         result = run_full_analysis(combined_text, gemini_api_key)
-        if result != "Error":
+        
+        if result:
             st.divider()
-            st.markdown("### 📝 Gemini 審稿建議")
+            st.markdown("### 📝 醫師審稿報告")
             st.markdown(result)
+            
+            # 提供下載按鈕
+            st.download_button(
+                label="下載審稿報告 (.txt)",
+                data=result,
+                file_name="review_report.txt",
+                mime="text/plain"
+            )
 
 elif not gemini_api_key:
-    st.warning("請先輸入 Google Gemini API Key。")
+    st.warning("👈 請先在左側輸入 Google Gemini API Key。")
