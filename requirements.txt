@@ -1,7 +1,6 @@
 streamlit
-openai
+google-generativeai
 pypdf
 biopython
-tiktoken
 python-docx
 Pillow
