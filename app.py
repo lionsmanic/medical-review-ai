@@ -7,150 +7,141 @@ from PIL import Image
 import io
 import base64
 
-# --- 設定頁面 ---
+# --- 頁面設定 ---
 st.set_page_config(page_title="全能醫學期刊審稿助手", layout="wide")
 
 with st.sidebar:
     st.header("設定")
     openai_api_key = st.text_input("輸入 OpenAI API Key", type="password")
-    email_address = st.text_input("輸入您的 Email (PubMed 用)", value="doctor@example.com")
+    # 這裡解釋了為什麼需要 Email
+    email_address = st.text_input(
+        "輸入 Email (NCBI 要求)", 
+        value="doctor@example.com",
+        help="NCBI 要求使用 API 時需附上聯絡 Email，若發生連線頻率過高時他們可能會通知您。"
+    )
     st.markdown("---")
-    st.info("支援格式：PDF, Word, JPG, PNG, TIFF")
+    st.info("💡 提示：您可以一次選取多個檔案 (PDF, Word, 圖檔) 上傳，AI 會自動合併閱讀。")
 
 Entrez.email = email_address
 
-# --- 工具函式區 ---
+# --- 工具函式 (讀取各類檔案) ---
 
-def get_text_from_pdf(pdf_file):
-    """讀取 PDF 文字"""
+def get_text_from_pdf(file_obj):
     try:
-        reader = PdfReader(pdf_file)
+        reader = PdfReader(file_obj)
         text = ""
         for page in reader.pages:
             extract = page.extract_text()
             if extract: text += extract
         return text
     except Exception as e:
-        return f"PDF 讀取錯誤: {e}"
+        return f"[PDF讀取錯誤: {e}]"
 
-def get_text_from_docx(docx_file):
-    """讀取 Word 文字"""
+def get_text_from_docx(file_obj):
     try:
-        doc = Document(docx_file)
+        doc = Document(file_obj)
         text = "\n".join([para.text for para in doc.paragraphs])
         return text
     except Exception as e:
-        return f"Word 讀取錯誤: {e}"
+        return f"[Word讀取錯誤: {e}]"
 
-def get_text_from_image(image_file, api_key, file_type):
-    """
-    利用 GPT-4o Vision 讀取圖片中的文字。
-    包含自動將 TIFF 轉為 PNG 的邏輯。
-    """
-    client = openai.OpenAI(api_key=api_key)
-    
-    # 處理圖片格式
-    image = Image.open(image_file)
-    
-    # 如果是 TIFF 或其他格式，統一轉為 PNG 以確保 API 相容性
-    buffered = io.BytesIO()
-    image.save(buffered, format="PNG")
-    base64_image = base64.b64encode(buffered.getvalue()).decode('utf-8')
+def get_text_from_image(file_obj, api_key):
+    """利用 GPT-4o Vision 讀取圖表內容"""
+    try:
+        # 轉為 Image 物件
+        image = Image.open(file_obj)
+        
+        # 統一轉為 PNG 用於 API 傳輸
+        buffered = io.BytesIO()
+        image.save(buffered, format="PNG")
+        base64_image = base64.b64encode(buffered.getvalue()).decode('utf-8')
 
-    st.caption("正在使用 AI 視覺辨識圖片內容...")
-    
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "請將這張圖片中的醫學論文內容轉錄為純文字，忽略頁碼或浮水印，只保留內文。"},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/png;base64,{base64_image}"
-                        }
-                    }
-                ]
-            }
-        ],
-        max_tokens=2000
-    )
-    return response.choices[0].message.content
+        client = openai.OpenAI(api_key=api_key)
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "這是醫學論文的圖表或附圖。請詳細描述圖片中的數據、標題與文字內容。"},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}}
+                    ]
+                }
+            ],
+            max_tokens=1000
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"[圖片辨識錯誤: {e}]"
+
+# --- 核心 AI 分析函式 ---
 
 def search_pubmed(keywords, max_results=5):
-    """搜尋 PubMed (維持不變)"""
     try:
-        # 搜尋最近 2 年
-        search_term = f"{keywords} AND (2024[Date - Publication] : 3000[Date - Publication])"
+        # 搜尋 2024 年至今的文章
+        search_term = f"{keywords} AND (2024/01/01[Date - Publication] : 3000[Date - Publication])"
         handle = Entrez.esearch(db="pubmed", term=search_term, retmax=max_results, sort="date")
         record = Entrez.read(handle)
         handle.close()
         
         id_list = record["IdList"]
         if not id_list:
-            return "未找到相關最新文獻。"
+            return "未找到相關最新文獻 (2024-Now)。"
 
         handle = Entrez.efetch(db="pubmed", id=id_list, rettype="abstract", retmode="text")
         abstracts = handle.read()
         handle.close()
         return abstracts
     except Exception as e:
-        return f"PubMed 搜尋錯誤: {e}"
+        return f"PubMed API 錯誤: {e}"
 
-def analyze_and_generate_review(paper_text, api_key):
-    """
-    整合流程：
-    1. 抓關鍵字 -> 2. 查 PubMed -> 3. 生成口語化評論
-    """
+def analyze_and_generate_review(full_text, api_key):
     client = openai.OpenAI(api_key=api_key)
     
     # 1. 抓關鍵字
-    st.status("步驟 1/3: 分析論文主題與關鍵字...", expanded=True)
+    st.status("步驟 1/3: 綜合分析所有檔案內容，提取主題...", expanded=True)
     prompt_extract = f"""
-    請閱讀以下論文摘要或片段，提取 3-5 個用於 PubMed 搜尋的核心英文醫學關鍵字 (MeSH terms 佳)。
-    只回傳關鍵字，用空格隔開。
+    以下是投稿論文的完整內容（包含 Cover letter, 正文, 圖表說明）。
+    請提取 3-5 個核心醫學關鍵字 (MeSH terms) 用於搜尋最新文獻。
     
-    內容: {paper_text[:2000]}
+    內容片段: 
+    {full_text[:3000]}
     """
     kw_resp = client.chat.completions.create(
         model="gpt-4o", messages=[{"role": "user", "content": prompt_extract}]
     )
     keywords = kw_resp.choices[0].message.content
-    st.success(f"關鍵字: {keywords}")
+    st.success(f"搜尋關鍵字: {keywords}")
     
     # 2. 查 PubMed
-    st.status("步驟 2/3: 搜尋 PubMed 最新文獻...", expanded=True)
+    st.status(f"步驟 2/3: 正在搜尋 PubMed 關於 {keywords} 的最新文章...", expanded=True)
     pubmed_data = search_pubmed(keywords)
-    with st.expander("點擊查看抓取到的文獻摘要"):
-        st.text(pubmed_data[:2000] + "...") # 預覽部分
-
+    
     # 3. 生成評論
-    st.status("步驟 3/3: 生成口語化審閱報告...", expanded=True)
+    st.status("步驟 3/3: 正在撰寫口語化審閱報告...", expanded=True)
     
     system_prompt = """
-    你是一位資深、臨床經驗豐富的醫師前輩。你正在協助同事審閱論文。
+    你是一位資深、臨床經驗豐富的醫師。這是一份來自你同事的論文投稿（可能包含多個檔案內容）。
     
-    語氣指引：
-    - **高度口語化**：像是在醫生休息室喝咖啡時的對話。
-    - **避免 AI 腔**：禁止使用「首先、其次、綜上所述」這類八股文。
-    - **專業但輕鬆**：例如「這篇講 HIFU 的切入點蠻特別的，但我看了一下最新的 paper，像 Chen et al. 那篇，結論好像有點出入...」。
+    語氣要求：
+    1. **口語化**：像是在晨會或休息室跟學弟妹討論案子，不要像機器人。
+    2. **專業且直接**：針對研究設計、數據與最新文獻的差異進行評論。
     
-    任務：
-    1. 總結這篇文章想解決什麼臨床問題。
-    2. 對比我提供的 PubMed 最新文獻，指出這篇文章的創新或過時之處。
-    3. 列出 3-5 個具體且尖銳的問題 (Questions for authors)，這是要用來幫作者釐清盲點的。
+    你的任務：
+    1. **整體評價**：綜合 Cover letter 與正文，簡單說這篇想幹嘛，有沒有搞頭。
+    2. **文獻對照**：參考我給你的 PubMed 最新摘要，指出這篇論文的論點是否跟現在最新的風向一致，還是有衝突？
+    3. **待釐清問題 (Queries)**：列出 3-5 個你需要作者解釋清楚的問題（例如數據怪怪的、選樣有偏誤等）。
     """
 
     user_prompt = f"""
-    【投稿文章片段】:
-    {paper_text[:6000]}
+    【投稿論文完整資料】:
+    {full_text[:8000]} 
+    (若內容過長已截斷，請根據現有資訊分析)
 
-    【PubMed 最新相關文獻】:
+    【PubMed 最新文獻 (2024-Now)】:
     {pubmed_data}
     
-    請用繁體中文輸出建議。
+    請用繁體中文輸出。
     """
 
     response = client.chat.completions.create(
@@ -163,45 +154,61 @@ def analyze_and_generate_review(paper_text, api_key):
     )
     return response.choices[0].message.content
 
-# --- 主程式邏輯 ---
-st.title("🩺 全能醫學期刊審稿助手")
-st.markdown("支援 **PDF, Word, JPG, PNG, TIFF**。上傳後自動聯網分析。")
+# --- 主程式 ---
+st.title("🩺 全能醫學期刊審稿助手 (多檔整合版)")
+st.markdown("支援 **一次上傳多個檔案** (Main text, Cover letter, Figures...)，AI 會自動整合分析。")
 
-# 允許上傳多種格式
-uploaded_file = st.file_uploader(
-    "請上傳檔案", 
-    type=['pdf', 'docx', 'jpg', 'jpeg', 'png', 'tiff', 'tif']
+# 這裡開啟 accept_multiple_files=True
+uploaded_files = st.file_uploader(
+    "請選擇所有相關檔案 (可多選)", 
+    type=['pdf', 'docx', 'jpg', 'jpeg', 'png', 'tiff', 'tif'],
+    accept_multiple_files=True
 )
 
-if uploaded_file and openai_api_key:
-    if st.button("開始分析"):
-        raw_text = ""
-        file_type = uploaded_file.name.split('.')[-1].lower()
+if uploaded_files and openai_api_key:
+    if st.button("開始整合分析"):
+        combined_text = ""
         
-        try:
-            with st.spinner('正在讀取檔案內容...'):
-                # 根據副檔名分流處理
+        # 建立進度條
+        progress_bar = st.progress(0)
+        total_files = len(uploaded_files)
+        
+        for idx, file in enumerate(uploaded_files):
+            file_name = file.name
+            file_type = file_name.split('.')[-1].lower()
+            
+            # 在文字中標註這是哪個檔案的內容，幫助 AI 區分
+            combined_text += f"\n\n--- 檔案來源：{file_name} ---\n"
+            
+            extracted_text = ""
+            try:
                 if file_type == 'pdf':
-                    raw_text = get_text_from_pdf(uploaded_file)
-                
+                    extracted_text = get_text_from_pdf(file)
                 elif file_type in ['docx', 'doc']:
-                    raw_text = get_text_from_docx(uploaded_file)
-                
+                    extracted_text = get_text_from_docx(file)
                 elif file_type in ['jpg', 'jpeg', 'png', 'tiff', 'tif']:
-                    # 圖片需要呼叫 API 進行視覺辨識
-                    raw_text = get_text_from_image(uploaded_file, openai_api_key, file_type)
+                    # 為了節省 API 呼叫與時間，這裡可以選擇是否對每張圖都跑 Vision
+                    # 或是只對有 'Table', 'Figure' 字眼的檔案跑
+                    extracted_text = f"[圖片內容]: {get_text_from_image(file, openai_api_key)}"
                 
-                if len(raw_text) < 50:
-                    st.error("讀取到的文字太少，請確認檔案內容是否清晰。")
-                else:
-                    # 進入分析流程
-                    final_review = analyze_and_generate_review(raw_text, openai_api_key)
-                    st.divider()
-                    st.markdown("### 📝 醫師審稿建議")
-                    st.markdown(final_review)
+                combined_text += extracted_text
+                
+            except Exception as e:
+                st.error(f"處理檔案 {file_name} 時發生錯誤: {e}")
+            
+            # 更新進度條
+            progress_bar.progress((idx + 1) / total_files)
 
+        st.success(f"已成功讀取 {total_files} 個檔案，開始 AI 分析...")
+        
+        # 呼叫分析函式
+        try:
+            final_review = analyze_and_generate_review(combined_text, openai_api_key)
+            st.divider()
+            st.markdown("### 📝 綜合審稿建議")
+            st.markdown(final_review)
         except Exception as e:
-            st.error(f"發生未預期的錯誤: {e}")
+            st.error(f"AI 分析過程發生錯誤: {e}")
 
 elif not openai_api_key:
-    st.warning("請先輸入 OpenAI API Key 才能運作。")
+    st.warning("請先輸入 OpenAI API Key。")
