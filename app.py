@@ -8,7 +8,7 @@ import io
 import time
 
 # --- 1. 頁面設定 ---
-st.set_page_config(page_title="AI 醫學期刊審稿助手 (自動換檔版)", layout="wide")
+st.set_page_config(page_title="AI 醫學期刊審稿助手 (自動偵測版)", layout="wide")
 
 # --- 2. 側邊欄設定 ---
 with st.sidebar:
@@ -16,7 +16,7 @@ with st.sidebar:
     gemini_api_key = st.text_input("輸入 Google Gemini API Key", type="password")
     email_address = st.text_input("輸入 Email (PubMed 規定)", value="doctor@example.com")
     st.markdown("---")
-    st.info("✅ 智慧模式：若 Flash 模型失敗，將自動降級至 Pro 模型。")
+    st.info("✅ 模式：自動偵測可用模型")
 
 Entrez.email = email_address
 
@@ -43,36 +43,77 @@ def get_text_from_word(file_obj, file_ext):
         else:
             return f"[Word 讀取錯誤: {e}]"
 
-def analyze_image_content(image_file, api_key):
+# --- 4. 動態模型偵測 (關鍵修復) ---
+def find_best_model(api_key):
     """
-    圖片分析也需要容錯機制，所以這裡也實作重試邏輯
+    直接詢問 API 有哪些模型可用，不再瞎猜名稱。
     """
-    candidates = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-pro']
     genai.configure(api_key=api_key)
+    try:
+        available_models = []
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                available_models.append(m.name)
+        
+        if not available_models:
+            return None, "沒有找到任何支援生成內容的模型 (權限或區域問題)。"
+            
+        # 優先順序策略：找 flash -> 找 pro -> 隨便選一個
+        # 模型名稱通常長這樣: models/gemini-1.5-flash
+        best_model = None
+        
+        # 1. 優先找 Flash (最快)
+        for m in available_models:
+            if 'flash' in m:
+                best_model = m
+                break
+        
+        # 2. 其次找 1.5 Pro
+        if not best_model:
+            for m in available_models:
+                if '1.5-pro' in m:
+                    best_model = m
+                    break
+        
+        # 3. 再不行找 gemini-pro
+        if not best_model:
+            for m in available_models:
+                if 'gemini-pro' in m:
+                    best_model = m
+                    break
+                    
+        # 4. 真的都沒有，就拿第一個
+        if not best_model:
+            best_model = available_models[0]
+            
+        return best_model, None
+
+    except Exception as e:
+        return None, str(e)
+
+# --- 5. 圖片分析 ---
+def analyze_image_content(image_file, api_key):
+    # 先取得可用模型
+    model_name, error = find_best_model(api_key)
+    if error: return f"[圖片分析失敗: {error}]"
     
-    # 處理圖片格式
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(model_name)
+    
     try:
         image = Image.open(image_file)
         if image.format == 'TIFF':
             buffered = io.BytesIO()
             image.save(buffered, format="PNG")
             image = Image.open(buffered)
+        
+        prompt = "這是醫學論文的附圖。請詳細描述數據、趨勢、圖表標題(如 Figure 1)與關鍵資訊。"
+        response = model.generate_content([prompt, image])
+        return response.text
     except Exception as e:
-        return f"[圖片開啟失敗: {e}]"
+        return f"[圖片分析錯誤: {e}]"
 
-    prompt = "這是醫學論文的附圖。請詳細描述數據、趨勢、圖表標題(如 Figure 1)與關鍵資訊。"
-
-    for model_name in candidates:
-        try:
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content([prompt, image])
-            return response.text
-        except Exception:
-            continue # 失敗就換下一個模型
-            
-    return "[錯誤：所有 AI 模型皆無法辨識此圖片，請檢查 API Key 或網路]"
-
-# --- 4. PubMed 搜尋 ---
+# --- 6. PubMed 搜尋 ---
 def search_pubmed(keywords, max_results=5):
     try:
         search_term = f"{keywords} AND (2024/01/01[Date - Publication] : 3000[Date - Publication])"
@@ -91,58 +132,34 @@ def search_pubmed(keywords, max_results=5):
     except Exception as e:
         return f"PubMed API 連線錯誤: {e}"
 
-# --- 5. 核心 AI 生成 (含自動換模型邏輯) ---
-def generate_content_with_fallback(prompt, api_key):
-    """
-    這是核心修正：嘗試多個模型，直到有一個成功為止。
-    """
-    genai.configure(api_key=api_key)
-    
-    # 優先順序：Flash (快) -> 1.5 Pro (強) -> Pro (舊版但穩)
-    models_to_try = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-pro']
-    
-    last_error = ""
-    
-    for model_name in models_to_try:
-        try:
-            # 嘗試建立模型並生成
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(prompt)
-            # 如果成功，回傳結果與使用的模型名稱
-            return response.text, model_name
-        except Exception as e:
-            error_msg = str(e)
-            # 如果是 404 (找不到模型) 或 503 (過載)，就試下一個
-            if "404" in error_msg or "not found" in error_msg or "503" in error_msg:
-                last_error = error_msg
-                continue 
-            else:
-                # 如果是 API Key 錯誤或其他嚴重錯誤，直接拋出
-                raise e
-    
-    # 如果迴圈跑完都沒成功
-    raise Exception(f"所有模型嘗試皆失敗。最後一次錯誤: {last_error}")
-
-# --- 6. 主流程 ---
+# --- 7. 核心 AI 流程 ---
 def run_full_analysis(combined_text, api_key):
     
-    # A. 提取關鍵字
-    st.status("步驟 1/3: 嘗試連線 AI 並提取關鍵字...", expanded=True)
+    # 步驟 0: 動態尋找模型
+    model_name, error = find_best_model(api_key)
+    if error:
+        return f"Error (模型偵測失敗): {error} \n請檢查 API Key 是否正確，或嘗試 `pip install -U google-generativeai`"
+    
+    st.toast(f"已自動連線至模型: {model_name}")
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(model_name)
+
+    # 步驟 A: 提取關鍵字
+    st.status(f"步驟 1/3: 使用 {model_name} 提取關鍵字...", expanded=True)
     keyword_prompt = f"請從以下內容提取 3-5 個醫學關鍵字 (MeSH terms)，用英文空格分隔：\n{combined_text[:5000]}"
     
     try:
-        # 使用新的容錯函式
-        keywords, used_model = generate_content_with_fallback(keyword_prompt, api_key)
-        keywords = keywords.strip()
-        st.success(f"關鍵字 ({used_model}): {keywords}")
+        kw_resp = model.generate_content(keyword_prompt)
+        keywords = kw_resp.text.strip()
+        st.success(f"關鍵字: {keywords}")
     except Exception as e:
-        return f"Error (關鍵字階段): {str(e)}"
+        return f"Error (關鍵字階段 - {model_name}): {str(e)}"
 
-    # B. PubMed
+    # 步驟 B: PubMed
     st.status("步驟 2/3: 搜尋 PubMed...", expanded=True)
     pubmed_data = search_pubmed(keywords)
     
-    # C. 審稿
+    # 步驟 C: 審稿 (含引用要求)
     st.status("步驟 3/3: 生成精確引用的審稿報告...", expanded=True)
     
     review_prompt = f"""
@@ -174,14 +191,14 @@ def run_full_analysis(combined_text, api_key):
     """
     
     try:
-        final_resp, used_model = generate_content_with_fallback(review_prompt, api_key)
-        return final_resp
+        final_resp = model.generate_content(review_prompt)
+        return final_resp.text
     except Exception as e:
-        return f"Error (生成報告階段): {str(e)}"
+        return f"Error (生成報告階段 - {model_name}): {str(e)}"
 
-# --- 7. 主介面 ---
-st.title("🩺 AI 醫學期刊審稿助手 (自動修復版)")
-st.markdown("支援 PDF, Word, 圖檔整合分析。**具備模型自動切換功能 (Flash/Pro)。**")
+# --- 8. 主介面 ---
+st.title("🩺 AI 醫學期刊審稿助手 (自動偵測版)")
+st.markdown("支援 PDF, Word, 圖檔。**自動尋找您帳號可用的最佳模型。**")
 
 uploaded_files = st.file_uploader(
     "請選擇檔案 (可多選)", 
@@ -204,11 +221,11 @@ if uploaded_files and gemini_api_key:
                 elif ext in ['docx', 'doc']:
                     combined_text += get_text_from_word(file, ext)
                 elif ext in ['jpg', 'jpeg', 'png', 'tiff', 'tif']:
-                    # 圖片部分也傳入 API Key 讓它自己去試模型
+                    # 圖片分析
                     combined_text += f"\n[圖表內容 - {file.name}]: {analyze_image_content(file, gemini_api_key)}\n"
                     time.sleep(1)
             except Exception as e:
-                st.warning(f"讀取檔案 {file.name} 時發生小錯誤 (已略過): {e}")
+                st.warning(f"讀取檔案 {file.name} 時發生小錯誤: {e}")
             
             progress.progress((i + 1) / len(uploaded_files))
             
@@ -216,8 +233,13 @@ if uploaded_files and gemini_api_key:
         
         if result and result.startswith("Error"):
             st.divider()
-            st.error("❌ 分析失敗，最終錯誤訊息：")
+            st.error("❌ 分析失敗，詳細錯誤如下：")
             st.code(result, language="text")
+            
+            # 這裡顯示一個診斷資訊，幫助使用者除錯
+            if "模型偵測失敗" in result:
+                st.info("💡 診斷建議：\n1. 請確認您的 API Key 沒有多複製空格。\n2. 請確認您已執行 `pip install -U google-generativeai`。")
+                
         elif result:
             st.divider()
             st.markdown("### 📝 醫師審稿報告")
