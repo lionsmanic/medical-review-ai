@@ -2,7 +2,7 @@ import google.generativeai as genai
 import os
 
 # --- 設定您的 API Key ---
-api_key = "這裡貼上您的_API_KEY" 
+api_key = "AIzaSyA6ZTusMROFzgVS2g7O7FzdqpcnNACd0c4" 
 
 print(f"正在測試 API Key: {api_key[:5]}... (隱藏後碼)")
 
