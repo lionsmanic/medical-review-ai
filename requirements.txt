@@ -1,0 +1,7 @@
+streamlit
+openai
+pypdf
+biopython
+tiktoken
+python-docx
+Pillow
