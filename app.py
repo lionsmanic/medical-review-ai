@@ -9,7 +9,7 @@ import time
 import os
 
 # --- 1. 頁面設定 ---
-st.set_page_config(page_title="AI 醫學期刊審稿助手 (Word/PDF/圖檔)", layout="wide")
+st.set_page_config(page_title="AI 醫學期刊審稿助手 (Debug版)", layout="wide")
 
 # --- 2. 側邊欄設定 ---
 with st.sidebar:
@@ -23,23 +23,12 @@ with st.sidebar:
     )
     
     st.markdown("---")
-    st.info("✅ 模型：Gemini 1.5 Flash (快速、長文本)")
-    st.markdown("### 支援格式說明")
-    st.markdown("""
-    - **PDF**: 標準格式
-    - **Word (.docx)**: 完美支援
-    - **Word (.doc)**: 舊版格式 (建議另存為 .docx 以確保讀取成功)
-    - **圖片**: JPG, PNG, TIFF (自動視覺辨識)
-    """)
+    st.info("✅ 模型：Gemini 1.5 Flash")
+    st.warning("🛠 此版本包含詳細除錯模式，若發生錯誤會顯示具體原因。")
 
 Entrez.email = email_address
 
-# --- 3. 初始化 Gemini ---
-def get_gemini_model(api_key):
-    genai.configure(api_key=api_key)
-    return genai.GenerativeModel('gemini-1.5-flash')
-
-# --- 4. 檔案讀取工具 ---
+# --- 3. 檔案讀取工具 ---
 
 def get_text_from_pdf(file_obj):
     try:
@@ -53,27 +42,21 @@ def get_text_from_pdf(file_obj):
         return f"[PDF 讀取錯誤: {e}]"
 
 def get_text_from_word(file_obj, file_ext):
-    """
-    處理 Word 檔案 (.docx 和 .doc)
-    """
+    """處理 Word 檔案 (.docx 和 .doc)"""
     try:
-        # 嘗試使用 python-docx 讀取
-        # python-docx 原生只支援 .docx
         doc = Document(file_obj)
         text = "\n".join([para.text for para in doc.paragraphs])
         return text
     except Exception as e:
-        # 如果讀取失敗，通常是因為使用者上傳了舊版 .doc
         if "doc" in file_ext and "docx" not in file_ext:
-            return "⚠️ [格式提示]: 偵測到舊版 Word (.doc) 格式。為了確保分析精確度，建議您將檔案打開並「另存新檔」為 .docx 格式後再上傳。"
+            return "⚠️ [格式提示]: 偵測到舊版 Word (.doc)。建議另存為 .docx 格式以確保讀取成功。"
         else:
             return f"[Word 讀取錯誤: {e}]"
 
 def analyze_image_content(image_file, model):
     try:
         image = Image.open(image_file)
-        # 針對 TIFF 做相容性轉換 (Gemini 有時對原始 TIFF 支援度不一)
-        if image.format == 'TIFF':
+        if image.format == 'TIFF': # TIFF 相容性處理
             buffered = io.BytesIO()
             image.save(buffered, format="PNG")
             image = Image.open(buffered)
@@ -84,9 +67,10 @@ def analyze_image_content(image_file, model):
     except Exception as e:
         return f"[圖片分析錯誤: {e}]"
 
-# --- 5. PubMed 搜尋 ---
+# --- 4. PubMed 搜尋 ---
 def search_pubmed(keywords, max_results=5):
     try:
+        # 搜尋 2024 年至今
         search_term = f"{keywords} AND (2024/01/01[Date - Publication] : 3000[Date - Publication])"
         handle = Entrez.esearch(db="pubmed", term=search_term, retmax=max_results, sort="date")
         record = Entrez.read(handle)
@@ -103,25 +87,32 @@ def search_pubmed(keywords, max_results=5):
     except Exception as e:
         return f"PubMed API 連線錯誤: {e}"
 
-# --- 6. AI 分析流程 ---
+# --- 5. 核心 AI 分析流程 (含詳細除錯) ---
 def run_full_analysis(combined_text, api_key):
-    model = get_gemini_model(api_key)
+    # 設定階段
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-1.5-flash')
+    except Exception as e:
+        return f"Error (API 設定失敗): {str(e)}"
     
-    # A. 關鍵字
+    # 階段 A: 提取關鍵字
     st.status("步驟 1/3: 提取關鍵字...", expanded=True)
     keyword_prompt = f"請從以下內容提取 3-5 個醫學關鍵字 (MeSH terms)，用英文空格分隔：\n{combined_text[:5000]}"
+    
     try:
         kw_resp = model.generate_content(keyword_prompt)
         keywords = kw_resp.text.strip()
         st.success(f"關鍵字: {keywords}")
-    except:
-        return "Error: API 連線失敗"
+    except Exception as e:
+        # 這裡會捕捉如 403, 404 等具體錯誤
+        return f"Error (Gemini 關鍵字提取階段失敗): {str(e)}"
 
-    # B. PubMed
+    # 階段 B: PubMed
     st.status("步驟 2/3: 搜尋 PubMed...", expanded=True)
     pubmed_data = search_pubmed(keywords)
     
-    # C. 審稿
+    # 階段 C: 審稿
     st.status("步驟 3/3: 生成審稿報告...", expanded=True)
     review_prompt = f"""
     角色：資深臨床醫師。
@@ -142,22 +133,29 @@ def run_full_analysis(combined_text, api_key):
     ---
     請用繁體中文回答。
     """
-    return model.generate_content(review_prompt).text
+    
+    try:
+        final_resp = model.generate_content(review_prompt)
+        return final_resp.text
+    except Exception as e:
+        return f"Error (Gemini 生成報告階段失敗): {str(e)}"
 
-# --- 7. 主介面 ---
-st.title("🩺 AI 醫學期刊審稿助手")
-st.markdown("支援 **PDF, Word (.docx/.doc), 圖檔** 多檔整合分析。")
+# --- 6. 主介面 ---
+st.title("🩺 AI 醫學期刊審稿助手 (Debug Mode)")
+st.markdown("支援 PDF, Word, 圖檔整合分析。**若發生錯誤將顯示詳細代碼。**")
 
-# 這裡加入 'doc' 到支援列表
 uploaded_files = st.file_uploader(
     "請選擇檔案 (可多選)", 
-    type=['pdf', 'docx', 'doc', 'jpg', 'png', 'tiff', 'tif'],
+    type=['pdf', 'docx', 'doc', 'jpg', 'jpeg', 'png', 'tiff', 'tif'],
     accept_multiple_files=True
 )
 
 if uploaded_files and gemini_api_key:
     if st.button("開始整合分析", type="primary"):
-        model = get_gemini_model(gemini_api_key)
+        # 重新初始化模型 (確保在按鈕按下時才建立連線)
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        genai.configure(api_key=gemini_api_key)
+        
         combined_text = ""
         progress = st.progress(0)
         
@@ -169,24 +167,28 @@ if uploaded_files and gemini_api_key:
                 if ext == 'pdf':
                     combined_text += get_text_from_pdf(file)
                 elif ext in ['docx', 'doc']:
-                    # 呼叫新的 Word 處理函式
                     combined_text += get_text_from_word(file, ext)
                 elif ext in ['jpg', 'jpeg', 'png', 'tiff', 'tif']:
                     combined_text += f"\n[圖表]: {analyze_image_content(file, model)}\n"
-                    time.sleep(1)
+                    time.sleep(1) # 避免圖片連發太快
             except Exception as e:
-                combined_text += f"[讀取錯誤: {e}]"
+                st.warning(f"讀取檔案 {file.name} 時發生小錯誤 (已略過): {e}")
             
             progress.progress((i + 1) / len(uploaded_files))
             
+        # 執行核心分析
         result = run_full_analysis(combined_text, gemini_api_key)
-        if result and "Error" not in result:
+        
+        # 這裡會判斷回傳的是不是錯誤訊息
+        if result and result.startswith("Error"):
+            st.divider()
+            st.error("❌ 分析失敗，請將以下錯誤訊息提供給工程師 (或貼給 AI 判斷)：")
+            st.code(result, language="text") # 顯示紅色的錯誤區塊
+        elif result:
             st.divider()
             st.markdown("### 📝 醫師審稿報告")
             st.markdown(result)
             st.download_button("下載報告", result, "review.txt")
-        elif "Error" in result:
-             st.error("分析過程發生錯誤，請檢查 API Key 或網路。")
 
 elif not gemini_api_key:
     st.warning("請先輸入 Google Gemini API Key")
